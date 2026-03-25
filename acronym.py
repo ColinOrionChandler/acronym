@@ -1,4 +1,3 @@
-
 # coding: utf-8
 
 """
@@ -27,7 +26,7 @@ import warnings
 import pandas as pd
 import astropy.io.fits as pyfits
 
-    
+
 # ignore overwriting reduced files warnings in case you need to rerun
 warnings.filterwarnings('ignore', message='Overwriting existing file')
 
@@ -37,6 +36,12 @@ if len(sys.argv) > 1:
     direc = sys.argv[1]
 else:
     direc = '.'
+
+
+def clean_filtname(s):
+    """Remove spaces, etc. from a filter name."""
+    s = s.replace(' ','').replace('#','')
+    return s
 
 cals_direc = os.path.join(direc, 'reduced', 'cals')
 reduced_direc = os.path.join(direc, 'reduced', 'data')
@@ -57,13 +62,22 @@ df['filt'] = pd.Series("", index=df.index)
 df['exp'] = pd.Series("", index=df.index)
 df['objname'] = pd.Series("", index=df.index)
 
-for ff,fname in enumerate(files):
+for ff, fname in enumerate(files):
     try:
-        df['objtype'][ff] = pyfits.open(fname)[0].header['IMAGETYP']
-        df['filt'][ff] = pyfits.open(fname)[0].header['FILTER']
-        df['exp'][ff] = pyfits.open(fname)[0].header['EXPTIME']
-        df['objname'][ff] = pyfits.open(fname)[0].header['OBJNAME']
-    except IOError:    
+        with pyfits.open(fname) as hdul:
+            hdr = hdul[0].header
+
+        df.loc[ff, 'objtype'] = hdr.get('IMAGETYP', '')
+        raw_filt = hdr.get('FILTER', '') or ''
+        # Normalize filter string: optionally remove "SDSS" prefix and any "#N" suffix, then strip whitespace.
+        filt_clean = raw_filt.replace('SDSS', '').strip()
+        # Drop any "#" and following (e.g., "r #1" -> "r")
+        if '#' in filt_clean:
+            filt_clean = filt_clean.split('#')[0].strip()
+        df.loc[ff, 'filt'] = filt_clean
+        df.loc[ff, 'exp'] = hdr.get('EXPTIME', '')
+        df.loc[ff, 'objname'] = hdr.get('OBJNAME', '')
+    except (IOError, OSError):
         print('\n File corrupt or missing: ' + fname)
 
        
@@ -161,8 +175,9 @@ if len(bias_idx) == 0:
 else:
     biases = np.array([trim_image(df['fname'][n])[0] for n in bias_idx])
     bias = np.median(biases,axis=0)
-    pyfits.writeto(os.path.join(cals_direc, 'master_bias.fits'),bias,overwrite=True)
-    print('   > Created master bias')
+    master_bias_fn = 'master_bias.fits'
+    pyfits.writeto(os.path.join(cals_direc, master_bias_fn),bias,overwrite=True)
+    print(f'   > Created master bias: {master_bias_fn}')
 
 
 
@@ -170,7 +185,7 @@ else:
 ### these are bias subtracted
 
 # array of all exposure times found
-times = list(filter(None,pd.unique(df.exp.ravel())))
+times = list(filter(None, pd.unique(df['exp'].to_numpy())))
 
 print('\n >>> Starting darks...')
 
@@ -184,7 +199,7 @@ for ii in range(0,len(times)):
 
         name = os.path.join(cals_direc,'master_dark_{0}.fits'.format(times[ii]))
         pyfits.writeto(name,dark_final,overwrite=True)
-        print('   > Created master '+ str(times[ii])+' second dark')
+        print('   > Created master ' + str(times[ii]) + f' second dark: {name}')
 
 
 
@@ -192,12 +207,14 @@ for ii in range(0,len(times)):
 ### these are bias and dark subtracted then normalized
 
 # array of all filters found
-filters = list(filter(None,pd.unique(df.filt.ravel())))
+filters = list(filter(None, pd.unique(df['filt'].to_numpy())))
+print(f'filters: {sorted(set(filters))}')
 
 print('\n >>> Starting flats...')
 
 for ii in range(0,len(filters)):
     flat_idx = df[(df['filt'] == filters[ii]) & (df['objtype'] == 'Flat')].index.tolist()
+    print(f'See flat_idx for {ii} is {flat_idx}')
     
     if len(flat_idx) == 0:
         print('   > No flats found for the ' + str(filters[ii]) + ' filter. Continuing reductions...')
@@ -211,13 +228,14 @@ for ii in range(0,len(filters)):
             dark = 0.
         
         flats = np.array([trim_image(df['fname'][n])[0] for n in flat_idx]) - bias - dark
+#       flats /= np.max(flats)
         flat_final = np.median(flats,axis=0)
         flat_final /= np.max(flat_final)
 
-        filts = filters[ii][-1]
+        filts = clean_filtname(filters[ii]) # [-1] <-- last letter, no good 12/22/2025
         name = os.path.join(cals_direc, 'master_flat_{0}.fits'.format(filts))
         pyfits.writeto(name,flat_final,overwrite=True)
-        print('   > Created master '+ str(filters[ii])+' flat')
+        print('   > Created master '+ str(filters[ii]) + f' flat: {name}')
 
 
 
@@ -238,9 +256,9 @@ for n in dat_idx:
     except IOError:
         dark = 0.
     
-    filt = (df['filt'][n])[-1]
+    filt = clean_filtname(df['filt'][n]) # [-1] <-- last letter, breaks things like CUVR 12/22/2025 COC
     try:
-        flat = flat = pyfits.getdata(os.path.join(cals_direc,'master_flat_{0}.fits'.format(filt)))
+        flat = pyfits.getdata(os.path.join(cals_direc,'master_flat_{0}.fits'.format(filt)))
     except IOError:
         print('   > Warning! No ' + str(df['filt'][n]) + ' filter flat found for ' + df['fname'][n])
         flat = 1.

@@ -933,6 +933,7 @@ def reduce_science_frames(
     mask_sigma: float,
     mask_dilation: int,
     bad_amp: str = "auto",
+    bad_amplifiers: str | None = None,
 ) -> list[dict[str, object]]:
     qa_rows: list[dict[str, object]] = []
     for record in science_records:
@@ -957,6 +958,14 @@ def reduce_science_frames(
             header["DARKEXP"] = (dark_exposure, "Exposure of source master dark")
         header["FLATMODE"] = (mode, "Flat-field mode applied")
         header["FLATFILE"] = (flat_filename, "Applied master flat")
+        if bad_amplifiers is not None and header.get("BADAMPS") != bad_amplifiers:
+            header["BADAMPS"] = (
+                bad_amplifiers,
+                "Amplifiers null in raw or calibration products",
+            )
+            header.add_history(
+                f"Acronym calibration products set amplifier(s) {bad_amplifiers} to NaN"
+            )
         header.add_history("Overscan, bias, dark, and flat corrections applied by Acronym")
         output_path = data_directory / f"red_{record.path.name}"
         _write_fits(output_path, reduced, header)
@@ -1087,6 +1096,7 @@ def run_pipeline(
         mask_sigma=source_mask_sigma,
         mask_dilation=source_mask_dilation,
         bad_amp=bad_amp,
+        bad_amplifiers=bad_amplifiers,
     )
     print("\n >>> Finished reductions!\n")
     return {

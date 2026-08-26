@@ -71,7 +71,7 @@ def write_quad(
         header["OBJNAME"] = "synthetic"
         header["RA"] = ra or "00:00:00"
         header["DEC"] = "+00:00:00"
-    fits.writeto(path, data, header=header)
+    fits.writeto(path, data, header=header, overwrite=True)
 
 
 def make_synthetic_dataset(
@@ -365,6 +365,30 @@ def test_dropped_amp_provenance_reaches_masters_and_science(tmp_path: Path) -> N
 
     reduced = fits.getdata(output / "data" / "red_image.0001.fits")
     np.testing.assert_allclose(reduced[:8, 8:], 1000.0, atol=1e-3)
+
+
+def test_bad_calibration_provenance_reaches_healthy_science(tmp_path: Path) -> None:
+    make_synthetic_dataset(tmp_path, science_count=1, drop_ll=True)
+    write_quad(
+        tmp_path / "image.0001.fits",
+        "Object",
+        "SDSS r #1",
+        10.0,
+        1007.0,
+        ra="00:00:00",
+        drop_ll=False,
+    )
+    output = tmp_path / "reduced_mixed_health"
+
+    acronym.run_pipeline(tmp_path, output_directory=output)
+
+    path = output / "data" / "red_image.0001.fits"
+    data, header = fits.getdata(path, header=True)
+    assert header["BADAMPS"] == "LL"
+    assert np.all(np.isnan(data[:8, :8]))
+    assert "calibration products set amplifier(s) LL to NaN" in " ".join(
+        header["HISTORY"]
+    )
 
 
 def test_superflat_products_and_sparse_fallback(tmp_path: Path) -> None:

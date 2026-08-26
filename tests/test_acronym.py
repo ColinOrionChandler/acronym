@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 from astropy.io import fits
 
 import acronym
@@ -51,6 +52,7 @@ def write_quad(
     exposure: float,
     active_signal: float,
     ra: str | None = None,
+    drop_ll: bool = False,
 ) -> None:
     overscan = 100.0
     data = np.full((16, 20), overscan, dtype=np.float32)
@@ -61,6 +63,9 @@ def write_quad(
         (slice(8, 16), slice(10, 18)),
     ):
         data[yslice, xslice] = overscan + active_signal
+    if drop_ll:
+        data[0:8, 0:8] = 65_310.0
+        data[0:8, 8:10] = 65_310.0
     header = quad_header(imagetype, filt, exposure)
     if imagetype == "Object":
         header["OBJNAME"] = "synthetic"
@@ -69,14 +74,38 @@ def write_quad(
     fits.writeto(path, data, header=header)
 
 
-def make_synthetic_dataset(tmp_path: Path, science_count: int = 4) -> Path:
-    write_quad(tmp_path / "bias.0001.fits", "Bias", "CU VR", 0.0, 5.0)
-    write_quad(tmp_path / "bias.0002.fits", "Bias", "CU VR", 0.0, 5.0)
-    write_quad(tmp_path / "dark.0001.fits", "Dark", "CU VR", 10.0, 7.0)
-    write_quad(tmp_path / "dark.0002.fits", "Dark", "CU VR", 10.0, 7.0)
-    write_quad(tmp_path / "flat.0001.fits", "Flat", "SDSS r #1", 10.0, 10007.0)
+def make_synthetic_dataset(
+    tmp_path: Path, science_count: int = 4, drop_ll: bool = False
+) -> Path:
+    write_quad(
+        tmp_path / "bias.0001.fits", "Bias", "CU VR", 0.0, 5.0, drop_ll=drop_ll
+    )
+    write_quad(
+        tmp_path / "bias.0002.fits", "Bias", "CU VR", 0.0, 5.0, drop_ll=drop_ll
+    )
+    write_quad(
+        tmp_path / "dark.0001.fits", "Dark", "CU VR", 10.0, 7.0, drop_ll=drop_ll
+    )
+    write_quad(
+        tmp_path / "dark.0002.fits", "Dark", "CU VR", 10.0, 7.0, drop_ll=drop_ll
+    )
+    write_quad(
+        tmp_path / "flat.0001.fits",
+        "Flat",
+        "SDSS r #1",
+        10.0,
+        10007.0,
+        drop_ll=drop_ll,
+    )
     # A different lamp level verifies per-frame normalization before combination.
-    write_quad(tmp_path / "flat.0002.fits", "Flat", "SDSS r #1", 10.0, 20007.0)
+    write_quad(
+        tmp_path / "flat.0002.fits",
+        "Flat",
+        "SDSS r #1",
+        10.0,
+        20007.0,
+        drop_ll=drop_ll,
+    )
     for index in range(science_count):
         # Thirty arcseconds between pointings at the equator.
         seconds = index * 2
@@ -87,8 +116,28 @@ def make_synthetic_dataset(tmp_path: Path, science_count: int = 4) -> Path:
             10.0,
             1007.0,
             ra=f"00:00:{seconds:02d}",
+            drop_ll=drop_ll,
         )
     return tmp_path
+
+
+def write_ur(path: Path, imagetype: str = "Object") -> None:
+    data = np.full((8, 10), 100.0, dtype=np.float32)
+    data[:, :8] = 125.0
+    header = fits.Header()
+    header["IMAGETYP"] = imagetype
+    header["FILTER"] = "SDSS r #1"
+    header["EXPTIME"] = 10.0
+    header["READAMPS"] = "UR"
+    header["CCDBIN1"] = 2
+    header["CCDBIN2"] = 2
+    header["DSEC22"] = "[1:8,1:8]"
+    header["BSEC22"] = "[9:10,1:8]"
+    if imagetype == "Object":
+        header["OBJNAME"] = "synthetic"
+        header["RA"] = "00:00:00"
+        header["DEC"] = "+00:00:00"
+    fits.writeto(path, data, header=header)
 
 
 def test_filter_normalization_preserves_multi_letter_filter() -> None:
@@ -115,6 +164,75 @@ def test_trim_image_quad_subtracts_each_amplifier_overscan(tmp_path: Path) -> No
     np.testing.assert_allclose(trimmed[8:, :8], 30.0, atol=1e-5)
     np.testing.assert_allclose(trimmed[8:, 8:], 40.0, atol=1e-5)
     assert result_header["OVSCORR"]
+
+
+def test_trim_image_auto_nulls_saturated_quad_and_allows_override(
+    tmp_path: Path,
+) -> None:
+    header = quad_header("Object", "r", 10.0)
+    data = np.full((16, 20), 100.0, dtype=np.float32)
+    data[0:8, 0:8] = 65_310.0
+    data[0:8, 8:10] = 65_310.0
+    data[0:8, 10:18] = 120.0
+    data[8:16, 0:8] = 130.0
+    data[8:16, 10:18] = 140.0
+    path = tmp_path / "dropped-ll.fits"
+    fits.writeto(path, data, header=header)
+
+    trimmed, result_header = acronym.trim_image(path)
+
+    assert np.all(np.isnan(trimmed[:8, :8]))
+    np.testing.assert_allclose(trimmed[:8, 8:], 20.0, atol=1e-5)
+    np.testing.assert_allclose(trimmed[8:, :8], 30.0, atol=1e-5)
+    np.testing.assert_allclose(trimmed[8:, 8:], 40.0, atol=1e-5)
+    assert result_header["BADAMPS"] == "LL"
+
+    unmasked, unmasked_header = acronym.trim_image(path, bad_amp="none")
+    assert np.all(np.isfinite(unmasked))
+    assert "BADAMPS" not in unmasked_header
+
+    healthy_path = tmp_path / "healthy.fits"
+    write_quad(healthy_path, "Object", "r", 10.0, 25.0)
+    forced, forced_header = acronym.trim_image(healthy_path, bad_amp="LL")
+    assert np.all(np.isnan(forced[:8, :8]))
+    assert np.all(np.isfinite(forced[:8, 8:]))
+    assert forced_header["BADAMPS"] == "LL"
+
+
+def test_trim_image_ur_uses_full_frame_amp_22_sections(tmp_path: Path) -> None:
+    path = tmp_path / "ur.fits"
+    write_ur(path)
+
+    trimmed, header = acronym.trim_image(path)
+
+    assert trimmed.shape == (8, 8)
+    np.testing.assert_allclose(trimmed, 25.0, atol=1e-5)
+    assert header["READAMPS"] == "UR"
+    assert header["OVSCORR"]
+    assert "BADAMPS" not in header
+
+
+def test_catalog_skips_truncated_fits_payload(tmp_path: Path) -> None:
+    write_quad(tmp_path / "good.fits", "Bias", "r", 0.0, 5.0)
+    truncated = tmp_path / "truncated.fits"
+    write_quad(truncated, "Flat", "r", 1.0, 1000.0)
+    truncated.write_bytes(truncated.read_bytes()[:3500])
+
+    records, failures = acronym.catalog_frames(tmp_path)
+
+    assert [record.path.name for record in records] == ["good.fits"]
+    assert len(failures) == 1
+    assert failures[0][0].name == "truncated.fits"
+
+
+def test_mixed_quad_and_ur_configs_are_rejected(tmp_path: Path) -> None:
+    write_quad(tmp_path / "quad.fits", "Bias", "r", 0.0, 5.0)
+    write_ur(tmp_path / "ur.fits", imagetype="Bias")
+    records, failures = acronym.catalog_frames(tmp_path)
+    assert not failures
+
+    with pytest.raises(ValueError, match="Multiple detector configurations"):
+        acronym._validate_detector_config(records)
 
 
 def test_select_dark_uses_exact_then_longest_dark() -> None:
@@ -222,6 +340,31 @@ def test_legacy_lamp_run_corrects_bias_and_writes_qa(tmp_path: Path) -> None:
     assert header["FLATMODE"] == "lamp"
     assert (output / "cals" / "master_flat_r.fits").exists()
     assert (output / "cals" / "calibration_qa.csv").exists()
+
+
+def test_dropped_amp_provenance_reaches_masters_and_science(tmp_path: Path) -> None:
+    make_synthetic_dataset(tmp_path, science_count=1, drop_ll=True)
+    output = tmp_path / "reduced_dropped_ll"
+
+    result = acronym.run_pipeline(tmp_path, output_directory=output)
+
+    assert result["bad_amplifiers"] == "LL"
+    product_paths = (
+        output / "cals" / "master_bias.fits",
+        output / "cals" / "master_dark_10.0.fits",
+        output / "cals" / "master_flat_r.fits",
+        output / "data" / "red_image.0001.fits",
+    )
+    for path in product_paths:
+        data = fits.getdata(path)
+        header = fits.getheader(path)
+        assert header["BADAMPS"] == "LL"
+        assert "to NaN before calibration" in " ".join(header["HISTORY"])
+        assert np.all(np.isnan(data[:8, :8]))
+        assert np.mean(np.isfinite(data[:8, 8:])) > 0.99
+
+    reduced = fits.getdata(output / "data" / "red_image.0001.fits")
+    np.testing.assert_allclose(reduced[:8, 8:], 1000.0, atol=1e-3)
 
 
 def test_superflat_products_and_sparse_fallback(tmp_path: Path) -> None:

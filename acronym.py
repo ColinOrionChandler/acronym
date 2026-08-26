@@ -34,6 +34,14 @@ from scipy.spatial.distance import squareform
 
 
 SATURATION_LEVEL = 65_000.0
+AMPLIFIER_SUFFIXES = {
+    "LL": "11",
+    "LR": "21",
+    "UL": "12",
+    "UR": "22",
+}
+SUFFIX_AMPLIFIERS = {suffix: name for name, suffix in AMPLIFIER_SUFFIXES.items()}
+BAD_AMP_CHOICES = ("auto", "none", *AMPLIFIER_SUFFIXES)
 
 
 @dataclass(frozen=True)
@@ -48,13 +56,23 @@ class FrameRecord:
     ra: str | float | None
     dec: str | float | None
     header: fits.Header
+    bad_amplifiers: tuple[str, ...] = ()
 
     @property
     def config_key(self) -> tuple[object, ...]:
-        sections = tuple(self.header.get(key, "") for key in (
-            "DSEC11", "DSEC21", "DSEC12", "DSEC22"
-        ))
-        return (self.readamps, *self.binning, *sections)
+        section_keys = tuple(
+            f"{prefix}{suffix}"
+            for prefix in ("DSEC", "BSEC")
+            for suffix in ("11", "21", "12", "22")
+        )
+        sections = tuple(self.header.get(key, "") for key in section_keys)
+        return (
+            self.readamps,
+            *self.binning,
+            self.header.get("NAXIS1"),
+            self.header.get("NAXIS2"),
+            *sections,
+        )
 
 
 @dataclass(frozen=True)
@@ -127,8 +145,48 @@ def _overscan_correct(
     return np.asarray(science, dtype=np.float32) - model[:, None].astype(np.float32)
 
 
+def _validate_bad_amp(bad_amp: str) -> str:
+    value = str(bad_amp).strip()
+    if value not in BAD_AMP_CHOICES:
+        choices = ", ".join(BAD_AMP_CHOICES)
+        raise ValueError(f"Unsupported bad_amp value {bad_amp!r}; choose from {choices}")
+    return value
+
+
+def _quad_bad_amplifiers(
+    raw: np.ndarray, header: fits.Header, bad_amp: str
+) -> tuple[str, ...]:
+    mode = _validate_bad_amp(bad_amp)
+    if str(header.get("READAMPS", "") or "") != "Quad" or mode == "none":
+        return ()
+    if mode != "auto":
+        return (mode,)
+
+    detected: list[str] = []
+    for suffix in ("11", "21", "12", "22"):
+        bias_key = f"BSEC{suffix}"
+        if bias_key not in header:
+            raise KeyError(f"Quad frame lacks {bias_key}")
+        overscan = _extract_section(raw, header[bias_key])
+        if float(np.nanmedian(overscan)) >= SATURATION_LEVEL:
+            detected.append(SUFFIX_AMPLIFIERS[suffix])
+    return tuple(detected)
+
+
+def _bad_amplifier_value(records: Sequence[FrameRecord]) -> str | None:
+    detected = {
+        amplifier
+        for record in records
+        for amplifier in record.bad_amplifiers
+    }
+    ordered = [name for name in AMPLIFIER_SUFFIXES if name in detected]
+    return " ".join(ordered) or None
+
+
 def trim_image(
-    filename: str | Path, overscan_poly_order: int = 3
+    filename: str | Path,
+    overscan_poly_order: int = 3,
+    bad_amp: str = "auto",
 ) -> tuple[np.ndarray, fits.Header]:
     """Overscan-correct and mosaic the active detector area of an ARCTIC frame."""
     # ARCTIC raw frames are unsigned integers represented with FITS BZERO/BSCALE;
@@ -137,8 +195,10 @@ def trim_image(
         raw = np.asarray(hdul[0].data)
         header = hdul[0].header.copy()
 
-    readamps = header.get("READAMPS", "")
+    mode = _validate_bad_amp(bad_amp)
+    readamps = str(header.get("READAMPS", "") or "")
     if readamps == "Quad":
+        bad_amplifiers = _quad_bad_amplifiers(raw, header, mode)
         amplifiers: dict[str, np.ndarray] = {}
         for suffix in ("11", "21", "12", "22"):
             data_key = f"DSEC{suffix}"
@@ -147,31 +207,61 @@ def trim_image(
                 raise KeyError(f"Quad frame lacks {data_key} or {bias_key}")
             science = _extract_section(raw, header[data_key])
             overscan = _extract_section(raw, header[bias_key])
-            amplifiers[suffix] = _overscan_correct(
-                science, overscan, polynomial_order=overscan_poly_order
-            )
+            amplifier_name = SUFFIX_AMPLIFIERS[suffix]
+            if amplifier_name in bad_amplifiers:
+                amplifiers[suffix] = np.full(science.shape, np.nan, dtype=np.float32)
+            else:
+                amplifiers[suffix] = _overscan_correct(
+                    science, overscan, polynomial_order=overscan_poly_order
+                )
         upper = np.concatenate((amplifiers["11"], amplifiers["21"]), axis=1)
         lower = np.concatenate((amplifiers["12"], amplifiers["22"]), axis=1)
         image = np.concatenate((upper, lower), axis=0)
-    elif readamps == "LL":
-        science = _extract_section(raw, header["DSEC11"])
-        overscan = _extract_section(raw, header["BSEC11"])
+    elif readamps in AMPLIFIER_SUFFIXES:
+        bad_amplifiers = ()
+        suffix = AMPLIFIER_SUFFIXES[readamps]
+        data_key = f"DSEC{suffix}"
+        bias_key = f"BSEC{suffix}"
+        if data_key not in header or bias_key not in header:
+            raise KeyError(f"{readamps} frame lacks {data_key} or {bias_key}")
+        science = _extract_section(raw, header[data_key])
+        overscan = _extract_section(raw, header[bias_key])
         image = _overscan_correct(
             science, overscan, polynomial_order=overscan_poly_order
         )
     else:
         raise ValueError(f"Unsupported READAMPS value {readamps!r} in {filename}")
 
-    header["OVSCORR"] = (True, "Amplifier overscan correction applied")
+    header["OVSCORR"] = (True, "Healthy amplifier overscan correction applied")
+    if bad_amplifiers:
+        names = " ".join(bad_amplifiers)
+        header["BADAMPS"] = (names, "Amplifiers replaced with NaN before calibration")
+        for name in bad_amplifiers:
+            suffix = AMPLIFIER_SUFFIXES[name]
+            header.add_history(
+                f"Acronym set amplifier {name} ({suffix}) data to NaN before calibration"
+            )
     return np.asarray(image, dtype=np.float32), header
 
 
-def catalog_frames(directory: str | Path) -> tuple[list[FrameRecord], list[tuple[Path, str]]]:
+def catalog_frames(
+    directory: str | Path, bad_amp: str = "auto"
+) -> tuple[list[FrameRecord], list[tuple[Path, str]]]:
+    mode = _validate_bad_amp(bad_amp)
     records: list[FrameRecord] = []
     failures: list[tuple[Path, str]] = []
     for path in sorted(Path(directory).glob("*.fits")):
         try:
-            header = fits.getheader(path, 0)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with fits.open(path, memmap=False) as hdul:
+                    header = hdul[0].header.copy()
+                    if hdul[0].data is None:
+                        raise ValueError("primary HDU has no image data")
+                    raw = np.asarray(hdul[0].data)
+            if raw.ndim != 2 or raw.size == 0:
+                raise ValueError(f"primary image has invalid shape {raw.shape}")
+            bad_amplifiers = _quad_bad_amplifiers(raw, header, mode)
             exposure = float(header.get("EXPTIME", 0.0) or 0.0)
             records.append(
                 FrameRecord(
@@ -185,24 +275,21 @@ def catalog_frames(directory: str | Path) -> tuple[list[FrameRecord], list[tuple
                     ra=header.get("RA"),
                     dec=header.get("DEC"),
                     header=header,
+                    bad_amplifiers=bad_amplifiers,
                 )
             )
-        except (OSError, ValueError, TypeError) as exc:
+        except (OSError, ValueError, TypeError, KeyError) as exc:
             failures.append((path, str(exc)))
     return records, failures
 
 
-def _validate_filter_configs(records: Sequence[FrameRecord]) -> None:
-    configs: dict[str, set[tuple[object, ...]]] = defaultdict(set)
-    for record in records:
-        if record.objtype in {"Flat", "Object"} and record.filt:
-            configs[record.filt].add(record.config_key)
-    incompatible = {filt: values for filt, values in configs.items() if len(values) > 1}
-    if incompatible:
-        names = ", ".join(sorted(incompatible))
+def _validate_detector_config(records: Sequence[FrameRecord]) -> None:
+    configs = {record.config_key for record in records}
+    if len(configs) > 1:
+        readout_modes = ", ".join(sorted({record.readamps for record in records}))
         raise ValueError(
-            "Multiple detector configurations were found within the same filter "
-            f"({names}); separate those configurations before reduction."
+            "Multiple detector configurations were found "
+            f"({readout_modes}); separate those configurations before reduction."
         )
 
 
@@ -257,6 +344,10 @@ def _calibration_header(caltype: str, **metadata: object) -> fits.Header:
     for key, value in metadata.items():
         if value is not None:
             header[key.upper()] = value
+    if metadata.get("BADAMPS"):
+        header.add_history(
+            f"Acronym inputs set amplifier(s) {metadata['BADAMPS']} to NaN before calibration"
+        )
     header.add_history("Created by Acronym ARCTIC reduction pipeline")
     return header
 
@@ -271,16 +362,23 @@ def _subtract_bias(data: np.ndarray, bias: np.ndarray | float) -> np.ndarray:
 
 
 def build_master_bias(
-    records: Sequence[FrameRecord], calibration_directory: Path
+    records: Sequence[FrameRecord],
+    calibration_directory: Path,
+    bad_amp: str = "auto",
 ) -> np.ndarray | float:
     bias_records = [record for record in records if record.objtype == "Bias"]
     if not bias_records:
         print("   > No biases found. Continuing reductions...")
         return 0.0
-    images = [trim_image(record.path)[0] for record in bias_records]
+    images = [trim_image(record.path, bad_amp=bad_amp)[0] for record in bias_records]
     master, _ = sigma_clipped_median(images, sigma=5.0)
     path = calibration_directory / "master_bias.fits"
-    header = _calibration_header("MASTER BIAS", NCOMB=len(images), OVSCORR=True)
+    header = _calibration_header(
+        "MASTER BIAS",
+        NCOMB=len(images),
+        OVSCORR=True,
+        BADAMPS=_bad_amplifier_value(bias_records),
+    )
     _write_fits(path, master, header)
     print(f"   > Created master bias: {path}")
     return master
@@ -290,6 +388,7 @@ def build_master_darks(
     records: Sequence[FrameRecord],
     bias: np.ndarray | float,
     calibration_directory: Path,
+    bad_amp: str = "auto",
 ) -> dict[float, np.ndarray]:
     grouped: dict[float, list[FrameRecord]] = defaultdict(list)
     for record in records:
@@ -298,7 +397,7 @@ def build_master_darks(
     masters: dict[float, np.ndarray] = {}
     for exposure in sorted(grouped):
         images = [
-            _subtract_bias(trim_image(record.path)[0], bias)
+            _subtract_bias(trim_image(record.path, bad_amp=bad_amp)[0], bias)
             for record in grouped[exposure]
         ]
         master, _ = sigma_clipped_median(images, sigma=5.0)
@@ -310,6 +409,7 @@ def build_master_darks(
             NCOMB=len(images),
             BIASCOR=True,
             OVSCORR=True,
+            BADAMPS=_bad_amplifier_value(grouped[exposure]),
         )
         _write_fits(path, master, header)
         print(f"   > Created master {exposure} second dark: {path}")
@@ -336,8 +436,9 @@ def calibrate_additive_signals(
     record: FrameRecord,
     bias: np.ndarray | float,
     darks: dict[float, np.ndarray],
+    bad_amp: str = "auto",
 ) -> tuple[np.ndarray, fits.Header, float | None, np.ndarray]:
-    trimmed, header = trim_image(record.path)
+    trimmed, header = trim_image(record.path, bad_amp=bad_amp)
     saturated = trimmed >= SATURATION_LEVEL
     calibrated = _subtract_bias(trimmed, bias)
     dark, source_exposure = select_dark(record.exposure, darks)
@@ -350,6 +451,7 @@ def build_lamp_flats(
     records: Sequence[FrameRecord],
     bias: np.ndarray | float,
     darks: dict[float, np.ndarray],
+    bad_amp: str = "auto",
 ) -> tuple[dict[str, np.ndarray], dict[str, int]]:
     grouped: dict[str, list[FrameRecord]] = defaultdict(list)
     for record in records:
@@ -360,7 +462,9 @@ def build_lamp_flats(
     for filt_name in sorted(grouped):
         normalized: list[np.ndarray] = []
         for record in grouped[filt_name]:
-            calibrated, _, _, saturated = calibrate_additive_signals(record, bias, darks)
+            calibrated, _, _, saturated = calibrate_additive_signals(
+                record, bias, darks, bad_amp=bad_amp
+            )
             invalid = saturated | ~np.isfinite(calibrated) | (calibrated <= 0)
             normalized.append(_normalize(calibrated, invalid))
         master, _ = sigma_clipped_median(normalized, sigma=5.0)
@@ -479,8 +583,11 @@ def measure_candidate(
     lamp_flat: np.ndarray,
     mask_sigma: float,
     mask_dilation: int,
+    bad_amp: str = "auto",
 ) -> CandidateMetric:
-    calibrated, _, _, saturated = calibrate_additive_signals(record, bias, darks)
+    calibrated, _, _, saturated = calibrate_additive_signals(
+        record, bias, darks, bad_amp=bad_amp
+    )
     lamp_corrected = np.full(calibrated.shape, np.nan, dtype=np.float32)
     valid_flat = np.isfinite(lamp_flat) & (lamp_flat > 0)
     lamp_corrected[valid_flat] = calibrated[valid_flat] / lamp_flat[valid_flat]
@@ -574,6 +681,8 @@ def build_superflats(
     mask_sigma: float,
     mask_dilation: int,
     smoothing_sigma: float,
+    bad_amp: str = "auto",
+    bad_amplifiers: str | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, str], list[dict[str, object]]]:
     applied = dict(lamp_flats)
     applied_modes = {filt_name: "lamp-fallback" for filt_name in lamp_flats}
@@ -589,6 +698,7 @@ def build_superflats(
             BIASCOR=True,
             DARKCOR=True,
             OVSCORR=True,
+            BADAMPS=bad_amplifiers,
         )
         _write_fits(calibration_directory / f"master_lamp_flat_{token}.fits", lamp_flat, lamp_header)
 
@@ -604,6 +714,7 @@ def build_superflats(
                 lamp_flat,
                 mask_sigma=mask_sigma,
                 mask_dilation=mask_dilation,
+                bad_amp=bad_amp,
             )
             for record in filter_records
         ]
@@ -658,7 +769,9 @@ def build_superflats(
         residual_stack: list[np.ndarray] = []
         for group_id in sorted(representatives):
             record = representatives[group_id].record
-            calibrated, _, _, saturated = calibrate_additive_signals(record, bias, darks)
+            calibrated, _, _, saturated = calibrate_additive_signals(
+                record, bias, darks, bad_amp=bad_amp
+            )
             residual = np.full(calibrated.shape, np.nan, dtype=np.float32)
             valid_flat = np.isfinite(lamp_flat) & (lamp_flat > 0)
             residual[valid_flat] = calibrated[valid_flat] / lamp_flat[valid_flat]
@@ -686,6 +799,7 @@ def build_superflats(
             "BIASCOR": True,
             "DARKCOR": True,
             "OVSCORR": True,
+            "BADAMPS": bad_amplifiers,
         }
         _write_fits(
             calibration_directory / f"master_science_flat_{token}.fits",
@@ -707,6 +821,7 @@ def build_superflats(
             FILTER=filt_name,
             NBORE=len(representatives),
             BORESEP=boresight_threshold,
+            BADAMPS=bad_amplifiers,
         )
         _write_fits(
             calibration_directory / f"superflat_coverage_{token}.fits",
@@ -748,6 +863,7 @@ def write_applied_flats(
     mask_sigma: float | None = None,
     mask_dilation: int | None = None,
     smoothing_sigma: float | None = None,
+    bad_amplifiers: str | None = None,
 ) -> None:
     boresight_counts: dict[str, int] = defaultdict(int)
     for row in superflat_manifest:
@@ -764,6 +880,7 @@ def write_applied_flats(
             BIASCOR=True,
             DARKCOR=True,
             OVSCORR=True,
+            BADAMPS=bad_amplifiers,
         )
         if mode == "hybrid":
             header["SOURCE"] = f"master_superflat_{token}.fits"
@@ -815,11 +932,12 @@ def reduce_science_frames(
     calibration_directory: Path,
     mask_sigma: float,
     mask_dilation: int,
+    bad_amp: str = "auto",
 ) -> list[dict[str, object]]:
     qa_rows: list[dict[str, object]] = []
     for record in science_records:
         calibrated, header, dark_exposure, saturated = calibrate_additive_signals(
-            record, bias, darks
+            record, bias, darks, bad_amp=bad_amp
         )
         flat = applied_flats.get(record.filt)
         mode = applied_modes.get(record.filt, "unity")
@@ -887,6 +1005,7 @@ def run_pipeline(
     source_mask_sigma: float = 3.0,
     source_mask_dilation: int = 15,
     illumination_smoothing_sigma: float = 64.0,
+    bad_amp: str = "auto",
 ) -> dict[str, object]:
     source_directory = Path(directory)
     output_root = (
@@ -894,22 +1013,30 @@ def run_pipeline(
     )
     calibration_directory = output_root / "cals"
     data_directory = output_root / "data"
+
+    records, failures = catalog_frames(source_directory, bad_amp=bad_amp)
+    for path, reason in failures:
+        print(f"   > Warning! Skipping unreadable FITS file {path}: {reason}")
+    _validate_detector_config(records)
+    bad_amplifiers = _bad_amplifier_value(records)
+    if bad_amplifiers is not None:
+        print(f"   > Nulling bad amplifier(s): {bad_amplifiers}")
+
     calibration_directory.mkdir(parents=True, exist_ok=True)
     data_directory.mkdir(parents=True, exist_ok=True)
 
-    records, failures = catalog_frames(source_directory)
-    for path, reason in failures:
-        print(f"   > Warning! Skipping unreadable FITS file {path}: {reason}")
-    _validate_filter_configs(records)
-
     print("\n >>> Starting bias combine...")
-    bias = build_master_bias(records, calibration_directory)
+    bias = build_master_bias(records, calibration_directory, bad_amp=bad_amp)
 
     print("\n >>> Starting darks...")
-    darks = build_master_darks(records, bias, calibration_directory)
+    darks = build_master_darks(
+        records, bias, calibration_directory, bad_amp=bad_amp
+    )
 
     print("\n >>> Starting lamp flats...")
-    lamp_flats, lamp_counts = build_lamp_flats(records, bias, darks)
+    lamp_flats, lamp_counts = build_lamp_flats(
+        records, bias, darks, bad_amp=bad_amp
+    )
     print(f"   > Filters: {sorted(lamp_flats)}")
 
     science_records = [record for record in records if record.objtype == "Object"]
@@ -927,6 +1054,8 @@ def run_pipeline(
             mask_sigma=source_mask_sigma,
             mask_dilation=source_mask_dilation,
             smoothing_sigma=illumination_smoothing_sigma,
+            bad_amp=bad_amp,
+            bad_amplifiers=bad_amplifiers,
         )
     else:
         applied_flats = dict(lamp_flats)
@@ -943,6 +1072,7 @@ def run_pipeline(
         mask_sigma=(source_mask_sigma if flat_mode == "superflat" else None),
         mask_dilation=(source_mask_dilation if flat_mode == "superflat" else None),
         smoothing_sigma=(illumination_smoothing_sigma if flat_mode == "superflat" else None),
+        bad_amplifiers=bad_amplifiers,
     )
 
     print(f"\n >>> {len(science_records)} science images found. Starting reductions...")
@@ -956,6 +1086,7 @@ def run_pipeline(
         calibration_directory,
         mask_sigma=source_mask_sigma,
         mask_dilation=source_mask_dilation,
+        bad_amp=bad_amp,
     )
     print("\n >>> Finished reductions!\n")
     return {
@@ -965,6 +1096,7 @@ def run_pipeline(
         "applied_modes": applied_modes,
         "manifest": manifest,
         "qa": qa_rows,
+        "bad_amplifiers": bad_amplifiers,
         "output_directory": output_root,
     }
 
@@ -981,6 +1113,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-dir",
         help="Output root containing cals/ and data/ (default: DATA/reduced)",
+    )
+    parser.add_argument(
+        "--bad-amp",
+        choices=BAD_AMP_CHOICES,
+        default="auto",
+        help="Bad Quad amplifier handling (default: auto)",
     )
     parser.add_argument("--boresight-separation-arcsec", type=float, default=15.0)
     parser.add_argument("--min-superflat-boresights", type=int, default=4)
@@ -1001,6 +1139,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         source_mask_sigma=args.source_mask_sigma,
         source_mask_dilation=args.source_mask_dilation,
         illumination_smoothing_sigma=args.illumination_smoothing_sigma,
+        bad_amp=args.bad_amp,
     )
     return 0
 

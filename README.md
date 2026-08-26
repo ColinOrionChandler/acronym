@@ -42,6 +42,28 @@ python acronym.py /path/to/raw/data \
   --output-dir /path/to/raw/data/reduced_superflat
 ```
 
+## Readout modes and failed amplifiers
+
+Acronym supports ARCTIC Quad readout and the LL, LR, UL, and UR
+single-amplifier modes. Single-amplifier reductions use the matching FITS data
+and bias sections; for example, UR uses `DSEC22` and `BSEC22`.
+
+By default, Quad frames are checked for a failed amplifier before any
+calibration. If the median of an amplifier's overscan section is at or above
+65,000 ADU, its science quadrant is replaced with `NaN`. The `BADAMPS` FITS
+keyword and history record the affected amplifier. Override automatic handling
+only when needed:
+
+```bash
+python acronym.py /path/to/raw/data --bad-amp none
+python acronym.py /path/to/raw/data --bad-amp LL
+```
+
+A single reduction directory must contain only one detector/readout
+configuration; split Quad and single-amplifier data into separate runs with
+matching calibrations. Acronym validates each FITS payload before reduction and
+reports and skips unreadable or truncated files.
+
 ## Science-assisted superflats
 
 Superflat mode first builds the normal high-signal-to-noise lamp flat. Science

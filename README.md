@@ -23,6 +23,63 @@ OR place .py in your folder with data and run with no argument:
 
 **python acronym.py**
 
+Lamp flats remain the default, so existing commands keep the same interface. To
+build a science-assisted superflat instead:
+
+```bash
+python acronym.py /path/to/raw/data --flat-mode superflat
+```
+
+Use `--output-dir` to keep lamp and superflat trials separate:
+
+```bash
+python acronym.py /path/to/raw/data \
+  --flat-mode lamp \
+  --output-dir /path/to/raw/data/reduced_lamp
+
+python acronym.py /path/to/raw/data \
+  --flat-mode superflat \
+  --output-dir /path/to/raw/data/reduced_superflat
+```
+
+## Science-assisted superflats
+
+Superflat mode first builds the normal high-signal-to-noise lamp flat. Science
+frames are then grouped by filter and boresight using their `RA` and `DEC`
+headers. Pointings whose complete-linkage separation is no more than 15 arcsec
+belong to one boresight. One source-masked frame is selected from each boresight
+so repeated visits to a field do not dominate the result.
+
+For filters with at least four usable boresights, Acronym writes:
+
+- `master_lamp_flat_FILTER.fits`: the lamp-only response;
+- `master_science_flat_FILTER.fits`: a full, diagnostic science-derived flat;
+- `illumination_correction_FILTER.fits`: the smoothed science residual;
+- `master_superflat_FILTER.fits`: lamp flat times illumination correction;
+- `superflat_coverage_FILTER.fits`: the number of usable inputs per pixel; and
+- `master_flat_FILTER.fits`: the flat actually applied (the hybrid product).
+
+If fewer than four usable boresights are available, the applied
+`master_flat_FILTER.fits` remains the lamp flat and its FITS header records
+`FLATMODE=lamp-fallback`. `superflat_manifest.csv` records grouping, selection,
+masking, and fallback decisions. `calibration_qa.csv` records source-masked
+background uniformity metrics for every reduced science frame.
+
+The main tunable options are:
+
+```text
+--boresight-separation-arcsec 15
+--min-superflat-boresights 4
+--source-mask-sigma 3
+--source-mask-dilation 15
+--illumination-smoothing-sigma 64
+```
+
+All calibration modes apply per-amplifier overscan correction, subtract a
+master bias from darks/flats/science frames, and prefer an exact-exposure master
+dark. When an exact dark is unavailable, the longest available master dark is
+scaled to the requested exposure.
+
 Note that there is a requirements.txt file. To install necessary dependencies:
 
 **pip install -r requirements.txt**
@@ -59,4 +116,4 @@ Expected output for example directory reduction:
   This created _example/rawdata/reduced/cals/_ and _example/rawdata/reduced/data/_. In case of missing select calibration (e.g. 30 second darks), **acronym** will alert you, but continue to reduce the other images. 
   
 
-Please contact Kolby Weisenburger (kweis@uw.edu) with questions, issues or contributions. 
+Please contact Kolby Weisenburger (kweis@uw.edu) with questions, issues or contributions.

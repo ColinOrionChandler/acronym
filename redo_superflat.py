@@ -6,7 +6,7 @@ import argparse
 from collections import Counter
 from contextlib import redirect_stderr, redirect_stdout
 import csv
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -21,6 +21,7 @@ import sys
 import numpy as np
 from astropy.io import fits
 from astropy.coordinates import SkyCoord
+from astropy.time import Time
 from astropy import units as u
 from astropy.wcs import WCS
 
@@ -32,6 +33,10 @@ STAGES = ("hydration", "reduction", "organization", "solve", "cutout", "gif")
 GIF_DURATION_MS = 250
 CUTOUT_SIZE_ARCSEC = 126.0
 CUTOUT_PIXELS = 551
+BAND_LABELS = {
+    "u": "ultraviolet", "g": "green", "r": "red", "i": "infrared",
+    "z": "z", "v": "visual", "b": "blue",
+}
 
 
 class Pause(RuntimeError):
@@ -115,7 +120,11 @@ def discover_master(reduced, master=None):
     plausible = []
     for candidate in candidates:
         files = [p for p in fits_files(candidate) if not is_bad(p, candidate)] if candidate.is_dir() else []
-        if files and ({p.name for p in files} & existing_names):
+        # A fresh night has no reduced FITS to use for filename matching. In
+        # that case, accept a unique nonempty APO master; once reductions
+        # exist, retain the overlap check so an unrelated UT master cannot be
+        # selected accidentally.
+        if files and (not existing_names or ({p.name for p in files} & existing_names)):
             plausible.append(candidate)
     if len(plausible) != 1:
         raise Pause(f"Expected one matching ARCTIC master; found {len(plausible)}: {plausible}")
@@ -305,7 +314,8 @@ def checkpoint(state):
     atomic_json(root / "pipeline_state.json", state)
     fields = ["source", "object", "object_dir", "image_type", "filter", "excluded", "sha256", "bytes",
               *STAGES, "flat_mode", "badamps", "reduced_path", "organized_path", "wcs_source",
-              "solve_attempts", "cutout_fits", "cutout_png", "arrow_pdf", "gif_path", "ephemeris_id", "notes"]
+              "solve_attempts", "datetime_token", "band_token", "exptime_token", "cutout_fits", "cutout_png",
+              "arrow_pdf", "gif_path", "ephemeris_id", "notes"]
     atomic_csv(root / "frame_manifest.csv", state["frames"], fields)
     summary = object_summary(state)
     if summary:
@@ -548,6 +558,82 @@ def ephemeris(state, row, midpoint):
     return result
 
 
+def datetime_token(midpoint_jd):
+    """Return a UTC exposure-midpoint token rounded to the nearest second."""
+    value = Time(float(midpoint_jd), format="jd", scale="utc").to_datetime(timezone=timezone.utc)
+    value = value + timedelta(microseconds=500)
+    return value.replace(microsecond=0).strftime("%Y%m%d_%H%M%S")
+
+
+def band_token(header_or_value):
+    """Use readable broadband names while retaining unknown filter labels."""
+    raw = str(header_or_value.get("FILTER", "") if hasattr(header_or_value, "get") else header_or_value).strip()
+    compact = re.sub(r"[^a-z0-9]+", "", raw.casefold().replace("sdss", ""))
+    compact = re.sub(r"\d+$", "", compact)
+    if compact in {"clear", "open", "none"}:
+        return "clear"
+    if compact in BAND_LABELS:
+        return BAND_LABELS[compact]
+    # APO labels such as CUVR and SDSS r #1 identify the broadband by suffix.
+    for suffix, label in (("uv", "ultraviolet"), ("u", "ultraviolet"),
+                          ("g", "green"), ("r", "red"), ("i", "infrared"),
+                          ("z", "z"), ("v", "visual"), ("b", "blue")):
+        if compact.endswith(suffix):
+            return label
+    value = re.sub(r"[^A-Za-z0-9]+", "_", raw).strip("_")
+    return value or "unknown"
+
+
+def exptime_token(header_or_value):
+    """Return an exposure time suitable for a stable filename component."""
+    value = float(header_or_value.get("EXPTIME", 0) if hasattr(header_or_value, "get") else header_or_value)
+    if not np.isfinite(value) or value <= 0:
+        raise Pause(f"Missing or invalid exposure time for cutout naming: {value!r}")
+    text = f"{value:.3f}".rstrip("0").rstrip(".")
+    return f"{text}s"
+
+
+def thumbnail_rest(source):
+    """Keep the source thumbnail identity and orientation after the new prefix."""
+    stem = Path(source).stem
+    stem = re.sub(r"^(?:red|green|blue|infrared|ultraviolet|clear|visual|u|g|r|i|z|v|b)_",
+                  "", stem, flags=re.IGNORECASE)
+    return f"{stem}_{int(CUTOUT_SIZE_ARCSEC)}arcsec_NuEl"
+
+
+def cutout_name_parts(row, midpoint_jd=None, header=None):
+    source = Path(row.get("organized_path", row.get("source", "image.fits")))
+    if header is None:
+        header = fits.getheader(source) if source.is_file() else fits.Header()
+    if midpoint_jd is None:
+        midpoint_jd = row.get("midpoint_jd")
+    if midpoint_jd is None and source.is_file():
+        results, _ = cutout_helpers()
+        midpoint_jd = float(results.exposure_midpoint(header).jd)
+    if midpoint_jd is None:
+        midpoint_jd = 0.0
+    band = band_token(header if header.get("FILTER") else row.get("filter", ""))
+    exptime = exptime_token(header if header.get("EXPTIME") else row.get("exptime", 1))
+    prefix = f"{row['object_dir']}_{datetime_token(midpoint_jd)}_{band}_{exptime}"
+    return {"datetime": datetime_token(midpoint_jd), "band": band, "exptime": exptime,
+            "stem": f"{prefix}_{thumbnail_rest(source)}"}
+
+
+def cutout_product_paths(row, midpoint_jd=None, header=None):
+    source = Path(row.get("organized_path", row.get("source", "image.fits")))
+    stem = cutout_name_parts(row, midpoint_jd=midpoint_jd, header=header)["stem"]
+    directory = source.parent / "cutouts"
+    return {"fits": directory / f"{stem}.fits", "png": directory / f"{stem}.png",
+            "arrows": directory / f"{stem}_arrows.pdf"}
+
+
+def gif_product_path(state, first_row):
+    source = Path(first_row.get("organized_path", first_row.get("source", "image.fits")))
+    header = fits.getheader(source) if source.is_file() else None
+    parts = cutout_name_parts(first_row, header=header)
+    return Path(state["output"]) / first_row["object_dir"] / f"{parts['stem']}.gif"
+
+
 def create_cutout(state, row):
     results, helpers = cutout_helpers()
     source = Path(row["organized_path"])
@@ -578,9 +664,9 @@ def create_cutout(state, row):
         header[key] = value
     directory = source.parent / "cutouts"
     directory.mkdir(exist_ok=True)
-    # Keep raw exposure number and full original filename for collision-free identity.
-    stem = f"{row['object_dir']}_{source.stem}_126arcsec"
-    output, png, arrows = directory / (stem + ".fits"), directory / (stem + ".png"), directory / (stem + "_arrows.pdf")
+    paths = cutout_product_paths(row, midpoint_jd=float(midpoint.jd), header=fits.getheader(source))
+    output, png, arrows = paths["fits"], paths["png"], paths["arrows"]
+    directory.mkdir(exist_ok=True)
     fits.writeto(output, data, header, overwrite=True)
     with (Path(state["output"]) / "logs/cutouts.log").open("a", buffering=1) as log, redirect_stdout(log), redirect_stderr(log):
         results.coc_tools_fits2png(output, png)
@@ -592,10 +678,64 @@ def create_cutout(state, row):
         image.verify()
     if not arrows.read_bytes().startswith(b"%PDF"):
         raise Pause(f"Invalid arrow PDF: {arrows}")
+    parts = cutout_name_parts(row, midpoint_jd=float(midpoint.jd), header=fits.getheader(source))
     row.update(cutout="success" if row["solve"] == "success" else "warning",
                cutout_fits=str(output), cutout_png=str(png), arrow_pdf=str(arrows),
-               target_x=info["x"], target_y=info["y"], midpoint_jd=float(midpoint.jd))
+               target_x=info["x"], target_y=info["y"], midpoint_jd=float(midpoint.jd),
+               datetime_token=parts["datetime"], band_token=parts["band"], exptime_token=parts["exptime"])
     receipt(state, [output, png, arrows])
+
+
+def rename_product(state, old, new):
+    """Move a completed product and carry its receipt to the new pathname."""
+    old, new = Path(old), Path(new)
+    if old == new:
+        return
+    if old.is_file():
+        if new.exists():
+            raise Pause(f"Cutout naming collision: both old and new products exist: {old} and {new}")
+        new.parent.mkdir(parents=True, exist_ok=True)
+        old.rename(new)
+    elif not new.is_file():
+        return
+    expected = state["artifacts"].pop(str(old), None)
+    if expected is not None and digest(new) != expected:
+        raise Pause(f"Renamed product changed during migration: {new}")
+    state["artifacts"][str(new)] = digest(new)
+
+
+def rename_products(state):
+    """Migrate older cutout/GIF names without recomputing scientific products."""
+    for row in science_frames(state):
+        if row.get("cutout") not in {"success", "warning"}:
+            continue
+        old_paths = {"fits": row.get("cutout_fits"), "png": row.get("cutout_png"),
+                     "arrows": row.get("arrow_pdf")}
+        if not any(old_paths.values()):
+            continue
+        header = fits.getheader(row["organized_path"])
+        desired = cutout_product_paths(row, midpoint_jd=row.get("midpoint_jd"), header=header)
+        for key, old in old_paths.items():
+            if old:
+                rename_product(state, old, desired[key])
+                row[{"fits": "cutout_fits", "png": "cutout_png", "arrows": "arrow_pdf"}[key]] = str(desired[key])
+        parts = cutout_name_parts(row, midpoint_jd=row.get("midpoint_jd"), header=header)
+        row.update(datetime_token=parts["datetime"], band_token=parts["band"], exptime_token=parts["exptime"])
+        checkpoint(state)
+    by_object = {}
+    for row in science_frames(state):
+        by_object.setdefault(row["object"], []).append(row)
+    for rows in by_object.values():
+        if not any(row.get("gif") == "success" and row.get("gif_path") for row in rows):
+            continue
+        first = sorted(rows, key=lambda row: (float(row.get("midpoint_jd", 0.0)), row.get("source", "")))[0]
+        desired = gif_product_path(state, first)
+        old = next((row.get("gif_path") for row in rows if row.get("gif_path")), None)
+        if old:
+            rename_product(state, old, desired)
+        for row in rows:
+            row["gif_path"] = str(desired)
+        checkpoint(state)
 
 
 def cutout_frames(state):
@@ -635,7 +775,6 @@ def make_gifs(state):
     """Create one 250 ms GIF per object without resizing its PNG frames."""
     from PIL import Image, ImageSequence
 
-    root = Path(state["output"])
     by_object = {}
     for row in science_frames(state):
         by_object.setdefault(row["object"], []).append(row)
@@ -665,7 +804,8 @@ def make_gifs(state):
                     images.append(image.convert("RGBA"))
             if len(dimensions) != 1:
                 raise Pause(f"GIF source PNGs for {name} do not share dimensions: {sorted(dimensions)}")
-            output = root / rows[0]["object_dir"] / f"{rows[0]['object_dir']}.gif"
+            usable.sort(key=lambda row: (float(row.get("midpoint_jd", 0.0)), row.get("source", "")))
+            output = gif_product_path(state, usable[0])
             output.parent.mkdir(parents=True, exist_ok=True)
             images[0].save(output, format="GIF", save_all=True, append_images=images[1:],
                            duration=GIF_DURATION_MS, loop=0, disposal=2)
@@ -761,7 +901,7 @@ def main(argv=None):
         raise Pause("Output must be separate from raw and existing reduced trees")
     settings = {"flat_mode": "superflat", "bad_amp": "auto", "cutout_arcsec": CUTOUT_SIZE_ARCSEC,
                 "cutout_pixels": CUTOUT_PIXELS, "site": "705",
-                "gif_duration_ms": GIF_DURATION_MS,
+                "gif_duration_ms": GIF_DURATION_MS, "naming_version": 2,
                 "target_map": json.loads(Path(args.target_map).read_text()) if args.target_map else {}}
     if not isinstance(settings["target_map"], dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in settings["target_map"].items()):
         raise Pause("Target map must contain string names and string Horizons identifiers")
@@ -797,6 +937,7 @@ def main(argv=None):
             old_settings = state["settings"]
             old_settings.setdefault("gif_duration_ms", GIF_DURATION_MS)
             old_settings.setdefault("cutout_pixels", CUTOUT_PIXELS)
+            old_settings.setdefault("naming_version", 2)
             for row in state["frames"]:
                 row.setdefault("gif", "pending" if row.get("image_type") == "Object" and not row.get("excluded") else ("excluded" if row.get("excluded") else "not_applicable"))
             if {k: v for k, v in old_settings.items() if k != "target_map"} != {k: v for k, v in settings.items() if k != "target_map"}:
@@ -834,6 +975,7 @@ def main(argv=None):
         checkpoint(state)
         reduce_and_organize(state)
         solve_frames(state)
+        rename_products(state)
         cutout_frames(state)
         make_gifs(state)
         print("Auditing sources, manifests, WCS, and native-pixel products", flush=True)

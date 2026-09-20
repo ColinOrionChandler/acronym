@@ -83,10 +83,13 @@ The output defaults to a sibling `superflat_processed/`, containing `cals/`,
 551x551 pixels in both FITS and PNG products. Raw and previously reduced FITS are
 checksum protected. Inputs under `bad` directories are excluded.
 `master_manifest.csv` summarizes each object; `frame_manifest.csv` tracks each
-input, phase, and exception. Each object also gets `<object>/<object>.gif`, built
-from its cutout PNGs with unchanged 551x551 dimensions, 250 ms per frame, and
-infinite looping. Objects with one PNG are recorded as GIF-skipped. `validation.json`
-records the final audit.
+input, phase, and exception. Cutout names use
+`<object>_<YYYYMMDD_HHMMSS>_<band>_<exptime>s_<thumbnail>_126arcsec_NuEl`
+with the timestamp taken from the exposure midpoint and rounded to the nearest
+second. Each object with at least two PNGs gets a GIF named from its first
+chronological cutout using the same stem, built with unchanged 551x551
+dimensions, 250 ms per frame, and infinite looping. Objects with one PNG are
+recorded as GIF-skipped. `validation.json` records the final audit.
 
 Use `--preflight-only` for inspection without creating an output directory, or
 `--resume` to continue a matching checkpoint. Failed solves receive one retry;

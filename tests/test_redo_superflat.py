@@ -86,6 +86,19 @@ def test_object_names_and_collisions():
         runner.check_names([science_row(" ")])
 
 
+def test_cutout_name_uses_midpoint_band_exptime_and_thumbnail(tmp_path):
+    source = tmp_path / "red_image.0045.new_chip0.fits"
+    header = fits.Header()
+    header["FILTER"] = "SDSS r #1"
+    header["EXPTIME"] = 300.0
+    fits.writeto(source, np.ones((4, 4), dtype=np.float32), header)
+    row = science_row(organized_path=str(source), midpoint_jd=2461200.5)
+    parts = runner.cutout_name_parts(row)
+    assert parts["band"] == "red"
+    assert parts["exptime"] == "300s"
+    assert parts["stem"].startswith("P+2025_W3_20260609_000000_red_300s_image.0045.new_chip0_126arcsec_NuEl")
+
+
 @pytest.mark.parametrize("success,total,expected", [(43, 85, True), (42, 85, False), (2, 4, False), (0, 0, False)])
 def test_majority_threshold(success, total, expected):
     assert runner.majority_solved(success, total) == expected
@@ -191,12 +204,15 @@ def test_make_gifs_preserves_png_dimensions_and_uses_250ms(tmp_path):
         path = object_root / f"frame{index}.png"
         Image.new("RGBA", (17, 13), (value, value, value, 255)).save(path)
         pngs.append(path)
-    rows = [science_row(cutout="success", cutout_png=str(path), midpoint_jd=float(index),
+    rows = [science_row(cutout="success", cutout_png=str(path), midpoint_jd=2460000.0 + index,
                         object_dir="P+2025_W3", gif="pending")
             for index, path in enumerate(pngs)]
     state = {"output": str(tmp_path), "frames": rows, "artifacts": {}}
     runner.make_gifs(state)
-    output = tmp_path / "P+2025_W3" / "P+2025_W3.gif"
+    outputs = list((tmp_path / "P+2025_W3").glob("*.gif"))
+    assert len(outputs) == 1
+    output = outputs[0]
+    assert output.name.startswith("P+2025_W3_")
     assert output.is_file()
     with Image.open(output) as gif:
         frames = list(ImageSequence.Iterator(gif))

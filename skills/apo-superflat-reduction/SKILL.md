@@ -69,8 +69,13 @@ keep this installed copy synchronized when changing the workflow.
   orientation for distortion models that cannot be safely transformed. Record
   `CUTMODE=D4-PIX`, `CUTRSMP=False`, transform, and WCS source. These are
   predicted-position cutouts, not claims of detected objects.
-- For objects with at least two cutout PNGs, create one GIF at
-  `<object>/<object>.gif`, ordered by exposure midpoint, with the 551x551 PNG
+- Name each FITS, PNG, and arrow PDF with
+  `<object>_<YYYYMMDD_HHMMSS>_<band>_<exptime>s_<thumbnail>_126arcsec_NuEl`.
+  The timestamp is the exposure midpoint rounded to the nearest second, the
+  band is a readable label such as `red`, and `<thumbnail>` retains the source
+  image identity. For objects with at least two cutout PNGs, create one GIF
+  using the same stem as the first chronological cutout (so its filename has
+  the first datetime stamp), ordered by exposure midpoint, with the 551x551 PNG
   dimensions unchanged, 250 ms per frame, and an infinite loop. If an object has
   only one PNG, skip GIF creation and record that decision in the manifests.
 

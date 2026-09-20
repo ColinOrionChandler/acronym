@@ -33,10 +33,6 @@ STAGES = ("hydration", "reduction", "organization", "solve", "cutout", "gif")
 GIF_DURATION_MS = 250
 CUTOUT_SIZE_ARCSEC = 126.0
 CUTOUT_PIXELS = 551
-BAND_LABELS = {
-    "u": "ultraviolet", "g": "green", "r": "red", "i": "infrared",
-    "z": "z", "v": "visual", "b": "blue",
-}
 
 
 class Pause(RuntimeError):
@@ -566,21 +562,11 @@ def datetime_token(midpoint_jd):
 
 
 def band_token(header_or_value):
-    """Use readable broadband names while retaining unknown filter labels."""
+    """Use the literal filter band, dropping only survey suffix numbering."""
     raw = str(header_or_value.get("FILTER", "") if hasattr(header_or_value, "get") else header_or_value).strip()
-    compact = re.sub(r"[^a-z0-9]+", "", raw.casefold().replace("sdss", ""))
-    compact = re.sub(r"\d+$", "", compact)
-    if compact in {"clear", "open", "none"}:
-        return "clear"
-    if compact in BAND_LABELS:
-        return BAND_LABELS[compact]
-    # APO labels such as CUVR and SDSS r #1 identify the broadband by suffix.
-    for suffix, label in (("uv", "ultraviolet"), ("u", "ultraviolet"),
-                          ("g", "green"), ("r", "red"), ("i", "infrared"),
-                          ("z", "z"), ("v", "visual"), ("b", "blue")):
-        if compact.endswith(suffix):
-            return label
-    value = re.sub(r"[^A-Za-z0-9]+", "_", raw).strip("_")
+    value = re.sub(r"(?i)\bsdss\b", "", raw)
+    value = re.sub(r"[\s_#-]*\d+$", "", value).strip()
+    value = re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_")
     return value or "unknown"
 
 
@@ -594,10 +580,8 @@ def exptime_token(header_or_value):
 
 
 def thumbnail_rest(source):
-    """Keep the source thumbnail identity and orientation after the new prefix."""
+    """Keep the complete reduced thumbnail identity and orientation."""
     stem = Path(source).stem
-    stem = re.sub(r"^(?:red|green|blue|infrared|ultraviolet|clear|visual|u|g|r|i|z|v|b)_",
-                  "", stem, flags=re.IGNORECASE)
     return f"{stem}_{int(CUTOUT_SIZE_ARCSEC)}arcsec_NuEl"
 
 

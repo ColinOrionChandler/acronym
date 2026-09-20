@@ -86,7 +86,9 @@ checksum protected. Inputs under `bad` directories are excluded.
 input, phase, and exception. Cutout names use
 `<object>_<YYYYMMDD_HHMMSS>_<band>_<exptime>s_<thumbnail>_126arcsec_NuEl`
 with the timestamp taken from the exposure midpoint and rounded to the nearest
-second. Each object with at least two PNGs gets a GIF named from its first
+second. The band is the literal filter label with survey numbering removed
+(`r1` and `r_1` become `r`; `VR` remains `VR`), while the thumbnail portion
+retains the complete reduced filename. Each object with at least two PNGs gets a GIF named from its first
 chronological cutout using the same stem, built with unchanged 551x551
 dimensions, 250 ms per frame, and infinite looping. Objects with one PNG are
 recorded as GIF-skipped. `validation.json` records the final audit.

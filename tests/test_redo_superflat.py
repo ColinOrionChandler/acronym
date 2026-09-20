@@ -94,9 +94,11 @@ def test_cutout_name_uses_midpoint_band_exptime_and_thumbnail(tmp_path):
     fits.writeto(source, np.ones((4, 4), dtype=np.float32), header)
     row = science_row(organized_path=str(source), midpoint_jd=2461200.5)
     parts = runner.cutout_name_parts(row)
-    assert parts["band"] == "red"
+    assert parts["band"] == "r"
     assert parts["exptime"] == "300s"
-    assert parts["stem"].startswith("P+2025_W3_20260609_000000_red_300s_image.0045.new_chip0_126arcsec_NuEl")
+    assert parts["stem"].startswith("P+2025_W3_20260609_000000_r_300s_red_image.0045.new_chip0_126arcsec_NuEl")
+    assert runner.band_token("VR") == "VR"
+    assert runner.band_token("r_1") == "r"
 
 
 @pytest.mark.parametrize("success,total,expected", [(43, 85, True), (42, 85, False), (2, 4, False), (0, 0, False)])

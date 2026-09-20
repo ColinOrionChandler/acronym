@@ -72,8 +72,9 @@ keep this installed copy synchronized when changing the workflow.
 - Name each FITS, PNG, and arrow PDF with
   `<object>_<YYYYMMDD_HHMMSS>_<band>_<exptime>s_<thumbnail>_126arcsec_NuEl`.
   The timestamp is the exposure midpoint rounded to the nearest second, the
-  band is a readable label such as `red`, and `<thumbnail>` retains the source
-  image identity. For objects with at least two cutout PNGs, create one GIF
+  band is the literal filter label with survey numbering removed (`r1` and
+  `r_1` become `r`; `VR` remains `VR`), and `<thumbnail>` retains the complete
+  reduced source image identity. For objects with at least two cutout PNGs, create one GIF
   using the same stem as the first chronological cutout (so its filename has
   the first datetime stamp), ordered by exposure midpoint, with the 551x551 PNG
   dimensions unchanged, 250 ms per frame, and an infinite loop. If an object has

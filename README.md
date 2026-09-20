@@ -66,6 +66,42 @@ reports and skips unreadable or truncated files.
 
 ## Science-assisted superflats
 
+### Reprocess an existing APO night
+
+`redo_superflat.py` finds the raw ARCTIC master associated with an existing
+`YYYYMMDDUT_APO/reduced` directory, verifies Dropbox payloads, and runs superflat
+reduction, object organization, local astrometry.net solving, and 126-arcsecond
+object-centered FITS/PNG cutouts with arrow PDFs:
+
+```bash
+python redo_superflat.py /path/to/20260215UT_APO/reduced
+python redo_superflat.py /path/to/20260215UT_APO/reduced --master /path/to/APO/Q1UW09/UT260215
+```
+
+The output defaults to a sibling `superflat_processed/`, containing `cals/`,
+`data/`, `<object>/ARCTIC/`, and `<object>/ARCTIC/cutouts/`. Cutouts are fixed at
+551x551 pixels in both FITS and PNG products. Raw and previously reduced FITS are
+checksum protected. Inputs under `bad` directories are excluded.
+`master_manifest.csv` summarizes each object; `frame_manifest.csv` tracks each
+input, phase, and exception. Each object also gets `<object>/<object>.gif`, built
+from its cutout PNGs with unchanged 551x551 dimensions, 250 ms per frame, and
+infinite looping. Objects with one PNG are recorded as GIF-skipped. `validation.json`
+records the final audit.
+
+Use `--preflight-only` for inspection without creating an output directory, or
+`--resume` to continue a matching checkpoint. Failed solves receive one retry;
+when more than half solve, remaining frames may use their original WCS for
+explicitly unverified cutouts. Other unresolved failures pause with exit code 2.
+`--target-map mapping.json` resolves ambiguous Horizons names using a JSON object
+mapping observing-header names to Horizons identifiers.
+
+This local workflow uses the `COC` Python environment, configured astrometry.net
+indexes, and the existing `photometrypipeline` and `coc_tools` checkouts under
+`~/GitHub`. The reusable Codex skill is maintained in
+`skills/apo-superflat-reduction/` and installed in `~/.codex/skills/`.
+
+### Flat construction
+
 Superflat mode first builds the normal high-signal-to-noise lamp flat. Science
 frames are then grouped by filter and boresight using their `RA` and `DEC`
 headers. Pointings whose complete-linkage separation is no more than 15 arcsec

@@ -1,0 +1,3 @@
+interface:
+  display_name: "APO Superflat Reduction"
+  short_description: "Redo APO reductions with superflats and object cutouts"

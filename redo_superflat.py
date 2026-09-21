@@ -68,8 +68,17 @@ def is_bad(path, root):
     return any(part.casefold() == "bad" for part in path.relative_to(root).parts[:-1])
 
 
-def fits_files(root):
-    return sorted(p for p in Path(root).rglob("*") if p.is_file() and p.suffix.lower() in FITS_SUFFIXES)
+def fits_files(root, exclude=None):
+    root = Path(root)
+    excluded = Path(exclude).resolve() if exclude is not None else None
+    paths = []
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in FITS_SUFFIXES:
+            continue
+        if excluded is not None and path.resolve().is_relative_to(excluded):
+            continue
+        paths.append(path)
+    return sorted(paths)
 
 
 def object_directory(name):
@@ -94,7 +103,7 @@ def check_names(rows):
         row["object_dir"] = directory
 
 
-def discover_master(reduced, master=None):
+def discover_master(reduced, master=None, output=None):
     reduced = Path(reduced).expanduser().resolve()
     if not reduced.is_dir():
         raise Pause(f"Reduced directory does not exist: {reduced}")
@@ -111,7 +120,8 @@ def discover_master(reduced, master=None):
         candidates = [selected / "arctic" if (selected / "arctic").is_dir() else selected]
     else:
         candidates = sorted((base / "APO").glob(f"*/UT{date[2:]}/arctic"))
-    existing_names = {p.name.removeprefix("red_") for p in fits_files(reduced)
+    output = Path(output).expanduser().resolve() if output is not None else reduced / "superflat_processed"
+    existing_names = {p.name.removeprefix("red_") for p in fits_files(reduced, exclude=output)
                       if not is_bad(p, reduced)}
     plausible = []
     for candidate in candidates:
@@ -213,12 +223,12 @@ def inventory(master, probe=bounded_probe, progress=None):
     return rows
 
 
-def snapshot(root):
+def snapshot(root, exclude=None):
     return {str(p): {"sha256": digest(p), "bytes": p.stat().st_size,
-                     "mtime_ns": p.stat().st_mtime_ns} for p in fits_files(root)}
+                     "mtime_ns": p.stat().st_mtime_ns} for p in fits_files(root, exclude=exclude)}
 
 
-def preflight(reduced, master, date, progress=None, original_reduced=None):
+def preflight(reduced, master, date, progress=None, original_reduced=None, output=None):
     solve = shutil.which("solve-field")
     if not solve:
         raise Pause("Local solve-field is unavailable")
@@ -255,7 +265,7 @@ def preflight(reduced, master, date, progress=None, original_reduced=None):
         raise Pause(f"Missing calibration inputs; filters without flats: {missing}")
     if any(Path(row["source"]).parent != master or Path(row["source"]).suffix != ".fits" for row in eligible):
         raise Pause("Acronym expects top-level .fits inputs; this layout needs explicit staging before reduction")
-    old = snapshot(reduced) if original_reduced is None else original_reduced
+    old = snapshot(reduced, exclude=output) if original_reduced is None else original_reduced
     expected_bytes = sum(np.prod(row["shape"]) * 4 for row in science)
     required = int(expected_bytes * 4 + 2 * 1024**3)
     free = shutil.disk_usage(reduced.parent).free
@@ -343,7 +353,7 @@ def verify_sources(state):
             raise Pause(f"Raw source metadata changed: {path}")
         if row.get("sha256") and digest(path) != row["sha256"]:
             raise Pause(f"Raw source bytes changed: {path}")
-    if snapshot(state["reduced"]) != state["original_reduced"]:
+    if snapshot(state["reduced"], exclude=state["output"]) != state["original_reduced"]:
         raise Pause("The existing reduced FITS inventory or contents changed")
 
 
@@ -879,9 +889,10 @@ def main(argv=None):
         return 0
     if not args.reduced:
         raise Pause("A reduced-data path is required")
-    reduced, master, date = discover_master(args.reduced, args.master)
-    root = Path(args.output_dir).expanduser().resolve() if args.output_dir else reduced.parent / "superflat_processed"
-    if root == reduced or root == master or root.is_relative_to(reduced) or root.is_relative_to(master) or reduced.is_relative_to(root) or master.is_relative_to(root):
+    requested_output = Path(args.output_dir).expanduser().resolve() if args.output_dir else Path(args.reduced).expanduser().resolve() / "superflat_processed"
+    reduced, master, date = discover_master(args.reduced, args.master, requested_output)
+    root = requested_output
+    if root == reduced or root == master or root.is_relative_to(master) or reduced.is_relative_to(root) or master.is_relative_to(root):
         raise Pause("Output must be separate from raw and existing reduced trees")
     settings = {"flat_mode": "superflat", "bad_amp": "auto", "cutout_arcsec": CUTOUT_SIZE_ARCSEC,
                 "cutout_pixels": CUTOUT_PIXELS, "site": "705",
@@ -935,7 +946,7 @@ def main(argv=None):
                 verify_sources(state)
                 if state.get("executions") and state["executions"][0]["acronym_sha256"] != digest(REPO / "acronym.py"):
                     raise Pause("Acronym reduction code changed since this run; inspect compatibility before resuming")
-            elif snapshot(reduced) != state["original_reduced"]:
+            elif snapshot(reduced, exclude=root) != state["original_reduced"]:
                 raise Pause("The original reduced data changed during interrupted preflight")
             verify_receipts(state)
             if state.get("preflight_complete") and digest(state["astrometry_config"]) != state["astrometry_config_sha256"]:
@@ -943,13 +954,13 @@ def main(argv=None):
         else:
             state = {"version": 1, "reduced": str(reduced), "master": str(master), "output": str(root),
                      "date": date, "settings": settings, "artifacts": {}, "status": "running", "frames": [],
-                     "original_reduced": snapshot(reduced)}
+                     "original_reduced": snapshot(reduced, exclude=root)}
         if not state.get("preflight_complete"):
             def progress(rows):
                 state["frames"] = rows
                 checkpoint(state)
             checkpoint(state)
-            state.update(preflight(reduced, master, date, progress=progress, original_reduced=state["original_reduced"]))
+            state.update(preflight(reduced, master, date, progress=progress, original_reduced=state["original_reduced"], output=root))
             state["preflight_complete"] = True
         state.setdefault("executions", []).append({"utc": datetime.now(timezone.utc).isoformat(),
                                                   "runner_sha256": digest(__file__), "acronym_sha256": digest(REPO / "acronym.py"),

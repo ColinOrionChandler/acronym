@@ -21,8 +21,10 @@ keep this installed copy synchronized when changing the workflow.
    `arctic` child. Quote paths; do not retain presentation escapes such as `\_`.
    `--preflight-only` inspects without creating the output. Normal execution
    includes preflight, so a separate full preflight is optional.
-3. Default output is `REDUCED_PATH.parent/superflat_processed`. Keep per-phase
-   logs and checkpoints there. Use `--resume` only with the same input paths and
+3. Default output is `REDUCED_PATH/superflat_processed`, inside the supplied
+   reduced-data path. The runner excludes this output tree from raw/reduced
+   FITS inventory and source snapshots. Keep per-phase logs and checkpoints
+   there. Use `--resume` only with the same input paths and
    settings; the runner verifies saved source hashes and completed artifacts.
    Do not overwrite or discard a conflicting output tree. A stale lock requires
    confirming the recorded PID is no longer running before removing it.

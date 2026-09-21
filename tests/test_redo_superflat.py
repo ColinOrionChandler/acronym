@@ -36,6 +36,14 @@ def test_discovery_selects_arctic_and_refuses_ambiguity(tmp_path):
     assert runner.discover_master(reduced, master.parent)[1] == master
 
 
+def test_discovery_selects_unique_master_for_fresh_night(tmp_path):
+    reduced = tmp_path / "20260215UT_APO"
+    reduced.mkdir(parents=True)
+    master = tmp_path / "APO/Q1UW09/UT260215/arctic"
+    make_fits(master / "image.0001.fits")
+    assert runner.discover_master(reduced)[1:] == (master, "20260215")
+
+
 def test_bad_folders_are_excluded_without_reading_payload(tmp_path):
     make_fits(tmp_path / "image.fits")
     (tmp_path / "bad/nested").mkdir(parents=True)
@@ -287,7 +295,7 @@ def test_interrupted_preflight_can_resume(tmp_path, monkeypatch):
     make_fits(reduced / "red_image.fits")
     master = tmp_path / "raw"
     master.mkdir()
-    output = reduced.parent / "superflat_processed"
+    output = reduced / "superflat_processed"
     monkeypatch.setattr(runner, "discover_master", lambda *a: (reduced, master, "20260215"))
 
     def fail(*args, **kwargs):
